@@ -1,0 +1,8 @@
+# The build context is this whole directory, so anything big and irrelevant here
+# is uploaded to the builder on every build.  The Dockerfile fetches upstream
+# itself and only COPYs config/, entrypoint/ and patches/.
+upstream/
+.git/
+.trunk/
+__pycache__/
+*.pyc

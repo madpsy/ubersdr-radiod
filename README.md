@@ -13,6 +13,7 @@ changes have either been absorbed upstream or moved into UberSDR itself.
 ```
 UPSTREAM_REF                  upstream commit this image is pinned to
 VERSION                       release number published alongside :latest
+sync-upstream.sh              keeps upstream/ (untracked) at the pinned commit
 Dockerfile                    two-stage build: fetch + compile, then a slim runtime
 build.sh                      buildx wrapper (multi-arch, pin management)
 config/radiod@ubersdr.conf    seeded into the config volume on first run
@@ -94,6 +95,34 @@ because ka9q-radio publishes no tags — releases are marked by commit message.
 ```sh
 ./build.sh --ref main         # one-off build against upstream tip
 ./build.sh --update           # move the pin to tip and build
+./build.sh --no-sync          # don't refresh the upstream/ checkout
+```
+
+### Reading the code that was built
+
+The Dockerfile fetches upstream itself, shallow, inside the build — right for the
+build, useless for reading, because nothing lands on disk. `sync-upstream.sh`
+keeps a full checkout at `upstream/` on the same commit:
+
+```sh
+./sync-upstream.sh              # put upstream/ at the pinned UPSTREAM_REF
+./sync-upstream.sh --ref main   # ...at upstream tip instead
+```
+
+`build.sh` runs it before every build, so `upstream/` matches the image you just
+made; `--no-sync` skips that. It is advisory — if the sync fails (offline, or you
+have edits in `upstream/`) the build still goes ahead and prints a warning, since
+the image never depends on this copy.
+
+`upstream/` is gitignored and in `.dockerignore`, and the checkout is detached.
+It is disposable: delete it and re-run to get it back. Keeping it out of the tree
+is the point of the repo — `UPSTREAM_REF` stays the single source of truth for
+what gets built, and there is no second copy of upstream to quietly drift from
+it. The full history is what makes it worth having:
+
+```sh
+git -C upstream log --oneline <old-pin>..<new-pin>   # what a bump actually changes
+git -C upstream apply --check ../patches/*.patch     # do our patches still apply?
 ```
 
 Pinning is deliberate. Upstream moves quickly and has made changes that break us

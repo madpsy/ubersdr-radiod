@@ -5,6 +5,7 @@
 #   ./build.sh --amd64                # this arch only, loaded into the local docker
 #   ./build.sh --ref main             # track upstream tip instead of the pin
 #   ./build.sh --update               # move the pin to upstream tip, then build
+#   ./build.sh --no-sync              # skip refreshing the local upstream/ checkout
 #   ./build.sh --tag testing --push   # push madpsy/ka9q-radio:testing
 #   ./build.sh --latest --push        # push :$(cat VERSION) AND move :latest to it
 #
@@ -38,6 +39,7 @@ PUSH=0
 LOAD=0
 NO_CACHE=""
 UPDATE=0
+SYNC=1
 
 # Print the header comment block, stopping at the first line that is not a comment.
 usage() {
@@ -54,6 +56,7 @@ while [ $# -gt 0 ]; do
         --update)    UPDATE=1 ;;
         --push)      PUSH=1 ;;
         --no-cache)  NO_CACHE="--no-cache" ;;
+        --no-sync)   SYNC=0 ;;
         --tag)       TAGS+=("$2"); shift ;;
         --tag=*)     TAGS+=("${1#*=}") ;;
         --latest)    WANT_LATEST=1 ;;
@@ -88,6 +91,15 @@ if [ "$UPDATE" -eq 1 ]; then
 fi
 
 [ -n "$REF" ] || REF=$(cat UPSTREAM_REF)
+
+# Keep the local reference checkout in step with what is about to be built, so
+# "the code in the image" is always readable on disk.  Advisory only: the image
+# build fetches its own copy, so a failure here (offline, local edits in
+# upstream/) is worth a warning and nothing more.
+if [ "$SYNC" -eq 1 ]; then
+    ./sync-upstream.sh --ref "$REF" --quiet || \
+        echo "warning: upstream/ is not in sync with $REF (see above)" >&2
+fi
 
 BUILD_ARGS=(--build-arg "UPSTREAM_REF=$REF" --build-arg "UPSTREAM_REPO=$UPSTREAM_REPO")
 

@@ -2,3 +2,8 @@
 .DS_Store
 __pycache__/
 *.pyc
+
+# Local reference checkout of upstream ka9q-radio, made by sync-upstream.sh.
+# Untracked on purpose: UPSTREAM_REF is the source of truth for what gets built,
+# and this is a disposable convenience copy of it.
+upstream/
