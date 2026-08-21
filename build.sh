@@ -5,16 +5,23 @@
 #   ./build.sh --amd64                # this arch only, loaded into the local docker
 #   ./build.sh --ref main             # track upstream tip instead of the pin
 #   ./build.sh --update               # move the pin to upstream tip, then build
-#   ./build.sh --tag testing --push   # push madpsy/ubersdr-radiod:testing
+#   ./build.sh --tag testing --push   # push madpsy/ka9q-radio:testing
 #   ./build.sh --tag v3 --latest --push   # push :v3 AND move :latest to it
 #
-# "latest" is opt-in.  Without --latest the tag is never written or moved, so a
-# --tag testing push cannot disturb whatever :latest currently points at.
+# Images publish to madpsy/ka9q-radio, the same repository the old fork used, so
+# deployments pick a finished build up from :latest without editing compose on
+# every instance.  That repository still holds fork-built images, so "latest" is
+# opt-in: without --latest the tag is never written or moved, and a --tag testing
+# push cannot disturb what running instances pull.
+#
+# Moving :latest switches every instance to the upstream-based image on their
+# next pull.  To roll back, retag the last fork build:
+#   docker buildx imagetools create -t madpsy/ka9q-radio:latest madpsy/ka9q-radio:0.8.3
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-IMAGE="${IMAGE:-madpsy/ubersdr-radiod}"
+IMAGE="${IMAGE:-madpsy/ka9q-radio}"
 PLATFORM="linux/amd64,linux/arm64"
 TAGS=()
 WANT_LATEST=0
@@ -121,7 +128,10 @@ echo "  platforms: $PLATFORM"
 echo "  upstream:  $REF"
 if [ "$PUSH" -eq 1 ]; then
     if [ "$WANT_LATEST" -eq 1 ]; then
-        echo "  NOTE:      :latest WILL be moved to this build"
+        echo "  NOTE:      :latest WILL be moved to this build."
+        echo "             Every deployment pulling $IMAGE:latest switches to it."
+        echo "             Roll back with:"
+        echo "               docker buildx imagetools create -t $IMAGE:latest $IMAGE:0.8.3"
     else
         echo "  :latest is not in the list and will not be touched"
     fi

@@ -26,20 +26,35 @@ patches/                      empty by design; see patches/README.md
 ```sh
 ./build.sh --amd64                     # local single-arch build, loaded into docker
 ./build.sh                             # amd64 + arm64, result stays in the build cache
-./build.sh --tag testing --push        # publish madpsy/ubersdr-radiod:testing
+./build.sh --tag testing --push        # publish madpsy/ka9q-radio:testing
 ./build.sh --tag v1 --latest --push    # publish :v1 and move :latest to it
 ```
 
-### The `latest` tag is opt-in
+### Image name and the `latest` tag
 
-`latest` is only ever written when you pass `--latest`. An ordinary `--tag`
-push cannot move it, and `--tag latest` is refused outright — moving the tag
-everyone pulls should be a deliberate act, not a default. Before pushing, the
-script prints the tag list and states whether `latest` is included.
+Images publish to **`madpsy/ka9q-radio`** — the same Docker Hub repository the
+old fork used. That is deliberate: deployments already pull
+`madpsy/ka9q-radio:latest`, so finishing the migration is a single tag push
+rather than a compose edit on every instance.
 
-The image name is `madpsy/ubersdr-radiod`, deliberately separate from the old
-fork's `madpsy/ka9q-radio`, so nothing published here can affect a deployment
-still pulling the fork image.
+The consequence is that this repository holds two lineages: fork builds up to
+`0.8.3`, and upstream-based builds from `testing` onward. So `latest` is
+strictly opt-in:
+
+- it is written **only** when you pass `--latest`
+- an ordinary `--tag` push never writes or moves it
+- `--tag latest` is refused outright
+- the script prints the tag list and whether `latest` is affected before building
+
+**Moving `latest` switches every deployment on its next pull.** To roll back to
+the last fork build:
+
+```sh
+docker buildx imagetools create -t madpsy/ka9q-radio:latest madpsy/ka9q-radio:0.8.3
+```
+
+`0.8.3` and the pre-migration `latest` are the same digest
+(`sha256:ebbafeab…`), so that retag restores exactly what was running before.
 
 `docker-compose.yml` in the UberSDR repo should point its radiod service at this
 directory as the build context.
