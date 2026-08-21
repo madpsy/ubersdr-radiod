@@ -24,10 +24,22 @@ patches/                      empty by design; see patches/README.md
 ## Build
 
 ```sh
-./build.sh --amd64            # local single-arch build, loaded into docker
-./build.sh                    # amd64 + arm64
-./build.sh --push             # publish the multi-arch manifest
+./build.sh --amd64                     # local single-arch build, loaded into docker
+./build.sh                             # amd64 + arm64, result stays in the build cache
+./build.sh --tag testing --push        # publish madpsy/ubersdr-radiod:testing
+./build.sh --tag v1 --latest --push    # publish :v1 and move :latest to it
 ```
+
+### The `latest` tag is opt-in
+
+`latest` is only ever written when you pass `--latest`. An ordinary `--tag`
+push cannot move it, and `--tag latest` is refused outright — moving the tag
+everyone pulls should be a deliberate act, not a default. Before pushing, the
+script prints the tag list and states whether `latest` is included.
+
+The image name is `madpsy/ubersdr-radiod`, deliberately separate from the old
+fork's `madpsy/ka9q-radio`, so nothing published here can affect a deployment
+still pulling the fork image.
 
 `docker-compose.yml` in the UberSDR repo should point its radiod service at this
 directory as the build context.

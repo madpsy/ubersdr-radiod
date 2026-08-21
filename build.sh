@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
 # Build the UberSDR radiod container from upstream ka9q-radio.
 #
-#   ./build.sh                      # both arches, pinned upstream, load/push per flags
-#   ./build.sh --amd64              # this arch only, loaded into the local docker
-#   ./build.sh --ref main           # track upstream tip instead of the pin
-#   ./build.sh --update             # move the pin to upstream tip, then build
-#   ./build.sh --push               # push the multi-arch manifest
+#   ./build.sh                        # both arches, pinned upstream, stays in cache
+#   ./build.sh --amd64                # this arch only, loaded into the local docker
+#   ./build.sh --ref main             # track upstream tip instead of the pin
+#   ./build.sh --update               # move the pin to upstream tip, then build
+#   ./build.sh --tag testing --push   # push madpsy/ubersdr-radiod:testing
+#   ./build.sh --tag v3 --latest --push   # push :v3 AND move :latest to it
+#
+# "latest" is opt-in.  Without --latest the tag is never written or moved, so a
+# --tag testing push cannot disturb whatever :latest currently points at.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-IMAGE="${IMAGE:-ubersdr-radiod}"
-TAG="${TAG:-latest}"
+IMAGE="${IMAGE:-madpsy/ubersdr-radiod}"
 PLATFORM="linux/amd64,linux/arm64"
+TAGS=()
+WANT_LATEST=0
 UPSTREAM_REPO="${UPSTREAM_REPO:-https://github.com/ka9q/ka9q-radio.git}"
 REF=""
 PUSH=0
@@ -20,8 +25,9 @@ LOAD=0
 NO_CACHE=""
 UPDATE=0
 
+# Print the header comment block, stopping at the first line that is not a comment.
 usage() {
-    sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,${/^#/!q; s/^# \{0,1\}//p;}' "$0"
     exit "${1:-0}"
 }
 
@@ -34,8 +40,9 @@ while [ $# -gt 0 ]; do
         --update)    UPDATE=1 ;;
         --push)      PUSH=1 ;;
         --no-cache)  NO_CACHE="--no-cache" ;;
-        --tag)       TAG="$2"; shift ;;
-        --tag=*)     TAG="${1#*=}" ;;
+        --tag)       TAGS+=("$2"); shift ;;
+        --tag=*)     TAGS+=("${1#*=}") ;;
+        --latest)    WANT_LATEST=1 ;;
         -h|--help)   usage 0 ;;
         *)           echo "unknown option: $1" >&2; usage 1 ;;
     esac
@@ -87,9 +94,38 @@ elif [ "$LOAD" -eq 1 ]; then
     OUTPUT=(--load)
 fi
 
-echo "Building $IMAGE:$TAG"
+# Assemble the tag list.  "latest" is never implied: it is added only by --latest,
+# so an ordinary --tag push leaves the existing :latest manifest untouched.
+[ "${#TAGS[@]}" -gt 0 ] || TAGS=("testing")
+if [ "$WANT_LATEST" -eq 1 ]; then
+    TAGS+=("latest")
+fi
+
+# Refuse an accidental "latest" typed as a plain tag; it has to be the flag, so
+# that moving the tag everyone pulls is always a deliberate act.
+for t in "${TAGS[@]}"; do
+    if [ "$t" = "latest" ] && [ "$WANT_LATEST" -eq 0 ]; then
+        echo "refusing --tag latest; use --latest to move it deliberately" >&2
+        exit 1
+    fi
+done
+
+TAG_ARGS=()
+for t in "${TAGS[@]}"; do
+    TAG_ARGS+=(--tag "$IMAGE:$t")
+done
+
+echo "Building $IMAGE"
+echo "  tags:      ${TAGS[*]}"
 echo "  platforms: $PLATFORM"
 echo "  upstream:  $REF"
+if [ "$PUSH" -eq 1 ]; then
+    if [ "$WANT_LATEST" -eq 1 ]; then
+        echo "  NOTE:      :latest WILL be moved to this build"
+    else
+        echo "  :latest is not in the list and will not be touched"
+    fi
+fi
 echo
 
 # shellcheck disable=SC2086
@@ -98,12 +134,12 @@ docker buildx build \
     --platform "$PLATFORM" \
     "${BUILD_ARGS[@]}" \
     $NO_CACHE \
-    -t "$IMAGE:$TAG" \
+    "${TAG_ARGS[@]}" \
     "${OUTPUT[@]}" \
     .
 
 echo
-echo "Built $IMAGE:$TAG from ka9q-radio $REF"
+echo "Built $IMAGE (${TAGS[*]}) from ka9q-radio $REF"
 if [ "$PUSH" -eq 0 ] && [ "$LOAD" -eq 0 ]; then
     echo "Note: neither --push nor a single-arch build, so the result stayed in the"
     echo "build cache. Use --amd64 to load locally, or --push to publish."
