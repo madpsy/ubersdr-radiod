@@ -12,6 +12,7 @@ changes have either been absorbed upstream or moved into UberSDR itself.
 
 ```
 UPSTREAM_REF                  upstream commit this image is pinned to
+VERSION                       release number published alongside :latest
 Dockerfile                    two-stage build: fetch + compile, then a slim runtime
 build.sh                      buildx wrapper (multi-arch, pin management)
 config/radiod@ubersdr.conf    seeded into the config volume on first run
@@ -27,7 +28,7 @@ patches/                      empty by design; see patches/README.md
 ./build.sh --amd64                     # local single-arch build, loaded into docker
 ./build.sh                             # amd64 + arm64, result stays in the build cache
 ./build.sh --tag testing --push        # publish madpsy/ka9q-radio:testing
-./build.sh --tag v1 --latest --push    # publish :v1 and move :latest to it
+./build.sh --latest --push             # publish the VERSION number and move :latest to it
 ```
 
 ### Image name and the `latest` tag
@@ -55,6 +56,32 @@ docker buildx imagetools create -t madpsy/ka9q-radio:latest madpsy/ka9q-radio:0.
 
 `0.8.3` and the pre-migration `latest` are the same digest
 (`sha256:ebbafeab…`), so that retag restores exactly what was running before.
+
+### The `VERSION` file
+
+`VERSION` holds the release number this repository publishes — a single line,
+`0.9.0` for the first upstream-based release, picking up from the fork's `0.8.3`.
+
+`--latest` always publishes that number as a tag alongside `latest`:
+
+```sh
+./build.sh --latest --push     # publishes :0.9.0 and points :latest at it
+```
+
+The two move together on purpose. `latest` on its own is a moving target nobody
+can name; pairing it with a fixed number means whatever is running is always
+pullable by version, which is exactly what the rollback above needs.
+
+Bump `VERSION` in the same commit as the change it ships. Pushing a version that
+is already on Docker Hub is refused — the script checks before building:
+
+```
+madpsy/ka9q-radio:0.9.0 is already published.
+Bump VERSION for this release, or pass --force-version to overwrite it.
+```
+
+`--tag` is unaffected and still ignores `VERSION`, so throwaway pushes
+(`--tag testing --push`) never consume a release number.
 
 `docker-compose.yml` in the UberSDR repo should point its radiod service at this
 directory as the build context.
