@@ -71,10 +71,13 @@ RUN git init -q ka9q-radio \
 # Local patches, applied in filename order.  Empty by default -- see patches/README.md.
 COPY patches/ /build/patches/
 RUN set -e; \
+    : > /build/APPLIED_PATCHES; \
     for p in $(find /build/patches -maxdepth 1 -name '*.patch' | sort); do \
       echo "Applying $p"; \
       git -C /build/ka9q-radio apply --verbose "$p"; \
-    done
+      basename "$p" >> /build/APPLIED_PATCHES; \
+    done; \
+    if [ ! -s /build/APPLIED_PATCHES ]; then echo "(none)" > /build/APPLIED_PATCHES; fi
 
 WORKDIR /build/ka9q-radio
 
@@ -148,6 +151,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /usr/local/ /usr/local/
 COPY --from=builder /etc/radio/ /etc/radio/
 COPY --from=builder /build/UPSTREAM_SHA /usr/local/share/ka9q-radio/UPSTREAM_SHA
+# Which local patches this image carries, so a running container can answer that
+# without anyone guessing from the tag.
+COPY --from=builder /build/APPLIED_PATCHES /usr/local/share/ka9q-radio/APPLIED_PATCHES
 
 RUN ldconfig \
  && ln -sf /usr/local/lib/ka9q-radio/*.so /usr/local/lib/ 2>/dev/null || true

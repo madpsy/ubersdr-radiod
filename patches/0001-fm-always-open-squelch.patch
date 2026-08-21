@@ -1,0 +1,89 @@
+UberSDR: restore the "always open" FM squelch idiom
+
+WHAT
+  Treat a squelch-open threshold at or below 1e-30 -- the -999 dB our presets
+  use -- as "no squelch", in fm.c and wfm.c.
+
+WHY CONFIG CANNOT DO THIS
+  ka9q-radio used to map squelch-open <= -999 to exactly 0.0 (modes.c) and skip
+  the squelch when both thresholds were zero (fm.c).  Both halves were removed,
+  so -999 is now just dB2power(-999) = 1.26e-100: tiny, but positive.
+  That is not equivalent, because chan->fm.snr can be zero or negative -- the
+  cheap estimator is bb_power/noise - 1 and is used unclamped, and the variance
+  estimator is clamped with max(0.0, snr).  Since dB2power() cannot return
+  anything but a positive number, NO threshold keeps the gate open on a
+  noise-only channel.  radiod then emits no RTP at all for that channel, which
+  UberSDR sees as FM having a squelch nobody asked for.
+
+WHY UBERSDR CANNOT DO THIS
+  The decision is radiod's; by the time UberSDR could act there is no stream.
+  UberSDR gates audio itself (set_audio_gate / min_snr) and needs radiod to pass
+  everything through.
+
+WHAT WOULD LET US DROP IT
+  Upstream reinstating an explicit way to disable the FM squelch -- the old
+  sentinel, or a "squelch = no" key.  Worth raising upstream: -999 dB is a
+  documented idiom that now silently means something else.
+
+Applies to ka9q-radio cce087e2090ed71889697f3831f34ef7825d9a44.
+Verified: fm.o and wfm.o compile warning-free.
+
+diff --git a/src/fm.c b/src/fm.c
+index 59c071d..c90eda8 100644
+--- a/src/fm.c
++++ b/src/fm.c
+@@ -40,6 +40,17 @@ int demod_fm(void *arg){
+   if(!isfinite(chan->squelch.close) || chan->squelch.close == 0)
+     chan->squelch.close = 4; // close below ~ +6 dB
+ 
++  /* UberSDR: restore the "always open" squelch idiom.
++     A squelch-open threshold below this is nobody's literal intent; it is the
++     conventional way of asking for no squelch at all, and our presets say -999 dB.
++     It has to be a special case rather than just a very low threshold, because
++     chan->fm.snr is zero or negative on a noise-only channel -- the estimate is
++     bb_power/noise - 1, taken unclamped in the cheap path -- while dB2power()
++     can never return anything but a positive number.  So no threshold, however
++     small, keeps the gate open, and the channel emits no RTP at all.
++     UberSDR gates audio itself via set_audio_gate/min_snr and needs radiod to
++     pass everything through. */
++
+   chan->fm.devmax = 5000.; // nominal peak deviation Hz
+   chan->fm.modbw = 3000.;   // maximum modulating frequency Hz
+ 
+@@ -147,7 +158,7 @@ int demod_fm(void *arg){
+        If at any time the SNR >= open threshold, the sequence is aborted, the timer is restarted and normal operation continues
+     */
+     int const squelch_state_max = chan->squelch.tail + 5;
+-    if(chan->fm.snr >= chan->squelch.open){
++    if(chan->squelch.open <= SQUELCH_ALWAYS_OPEN || chan->fm.snr >= chan->squelch.open){
+       squelch_state = squelch_state_max; // hold open
+     } else if(squelch_state > 0 && (chan->fm.snr < chan->squelch.close || squelch_state < squelch_state_max)){
+       squelch_state--; // initiate or continue closing
+diff --git a/src/radio.h b/src/radio.h
+index fd2e6a9..5ddc115 100644
+--- a/src/radio.h
++++ b/src/radio.h
+@@ -30,6 +30,10 @@
+ 
+ 
+ 
++/* UberSDR: threshold below which a squelch-open setting means "no squelch at all".
++   See the comment in fm.c; presets express this as squelch-open = -999 (dB). */
++#define SQUELCH_ALWAYS_OPEN (1e-30)
++
+ /**
+    @brief The four demodulator types
+  */
+diff --git a/src/wfm.c b/src/wfm.c
+index 0de7bc7..46503fc 100644
+--- a/src/wfm.c
++++ b/src/wfm.c
+@@ -136,7 +136,7 @@ int demod_wfm(void *arg){
+ 
+     // Hysteresis
+     int const squelch_state_max = chan->squelch.tail + 1;
+-    if(chan->fm.snr >= chan->squelch.open || (squelch_state > 0 && snr >= chan->squelch.close))
++    if(chan->squelch.open <= SQUELCH_ALWAYS_OPEN || chan->fm.snr >= chan->squelch.open || (squelch_state > 0 && snr >= chan->squelch.close))
+       // Squelch is fully open
+       // tail timing is in blocks (usually 10 or 20 ms each)
+       squelch_state = squelch_state_max;
