@@ -1,0 +1,116 @@
+UberSDR: let a spectrum channel's bin count grow without corrupting the heap
+
+WHAT
+  Track the allocated length of chan->spectrum.bin_data in a new field and grow
+  the buffer when the requested bin count outgrows it, instead of inferring the
+  need from a local that cannot differ.
+
+WHY
+  In demod_spectrum() (src/spectrum.c) the buffer guard reads:
+
+      if(chan->spectrum.bin_data == NULL || chan->spectrum.bin_count != bin_count)
+
+  but the local `bin_count` is synced to chan->spectrum.bin_count earlier in the
+  same iteration -- in the `fft_n <= 0` reinitialization block, which a bin count
+  change is itself what triggers -- and again at the bottom of every loop.  The
+  two are therefore always equal by the time the guard runs, so only the NULL arm
+  can ever fire.  bin_data is allocated exactly once, at whatever bin count the
+  channel was created with, and stays that size forever.
+
+  narrowband_poll() and wideband_poll() then memset and fill bin_count elements
+  of it, and radio_status.c encodes bin_count of them.  So raising a live
+  channel's BIN_COUNT writes past the end of the block: with glibc that surfaces
+  as "corrupted size vs. prev_size in fastbins" and radiod dies, taking every
+  channel with it.
+
+  Lowering a bin count is safe (the buffer is merely oversized), which is why
+  this has stayed latent -- every existing client either holds its bin count
+  fixed or only ever reduces it.
+
+WHY CONFIG CANNOT DO THIS
+  It is a heap-sizing bug in the demodulator, reachable from any BIN_COUNT
+  command.  No configuration key affects it.
+
+WHY UBERSDR CANNOT DO THIS
+  Honestly: it could work around it, and did, with a per-SSRC ceiling recorded at
+  channel creation (spectrumBinCeiling, now removed).  A channel created with the
+  largest bin count it will ever need can shrink and regrow freely within that.
+  The cost is that the ceiling has to be chosen before the zoom that needs it is
+  known, and bins are float32 on the wire -- so every channel would carry its
+  deepest zoom's payload at every zoom, four bytes per bin per poll, whether or
+  not the view had any use for them.  With the guard fixed, bin_count follows the
+  view: 1,172 bins for a 234 kHz span, 1,024 for a 117 kHz one, and nothing pays
+  for a zoom it is not at.
+
+  The bug is also a live remote-triggerable heap overflow either way.
+
+WHAT WOULD LET US DROP IT
+  Upstream fixing the guard.  Worth sending: this is an upstream defect, not a
+  divergence we want, and anything that grows a spectrum channel's bin count hits
+  it.
+
+SECONDARY
+  The same block set `void *old = chan->spectrum.ring` before realloc'ing
+  bin_data, so the OOM path freed the ring buffer and leaked the old bin_data.
+  Corrected to bin_data while rewriting these lines.  The path ends in `goto
+  quit`, which tears the channel down regardless, so this was cosmetic.
+
+Applies to ka9q-radio cce087e2090ed71889697f3831f34ef7825d9a44.
+Verified: spectrum.c compiles warning-free under the project's own flags
+  (-std=gnu11 -Wall -Wextra -fcx-limited-range -D_GNU_SOURCE=1); radio.c,
+  radio_status.c, modes.c, control.c and monitor-data.c all syntax-check clean
+  against the added field.  NOT yet exercised against a running radiod -- the
+  first deployment should watch for the abort this is meant to prevent while
+  actually raising a live channel's bin count.
+
+diff --git a/src/radio.h b/src/radio.h
+index fd2e6a94..9c77ba3d 100644
+--- a/src/radio.h
++++ b/src/radio.h
+@@ -259,6 +259,7 @@ struct channel {
+     double noise_bw;  // Estimated noise bandwidth of bin with current window
+     int bin_count;    // Requested bin count
+     float *bin_data;  // Array of real floats with bin_count elements
++    int bin_data_size; // Elements actually allocated in bin_data; >= bin_count
+     double crossover;  // Crossover frequency between algorithms, Hz
+     double shape;     // Analysis window parameter if any (kaiser β, gaussian σ)
+     int fft_n;        // size of analysis FFT
+diff --git a/src/spectrum.c b/src/spectrum.c
+index b3577f6c..a0d93f5e 100644
+--- a/src/spectrum.c
++++ b/src/spectrum.c
+@@ -155,13 +155,24 @@ int demod_spectrum(void *arg){
+     }
+     if(response_needed){      // Generate new bin data for the next response
+       // Make sure output frequency bin data buffers exist
+-      if(chan->spectrum.bin_data == NULL || chan->spectrum.bin_count != bin_count){
+-	void *old = chan->spectrum.ring;
++      /* Grow the bin buffer whenever the requested bin count outgrows what was
++	 allocated.  This used to compare chan->spectrum.bin_count against the
++	 local bin_count, but that local is synced to it earlier in this same
++	 iteration (in the fft_n <= 0 reinitialization above) and again at the
++	 bottom of the loop, so the two are always equal here and only the NULL
++	 arm could ever fire.  bin_data therefore stayed at whatever size it was
++	 first allocated at while the polls below memset and fill bin_count
++	 elements, so raising a live channel's bin count wrote past the end of
++	 the block.  Track the allocation instead of inferring it. */
++      if(chan->spectrum.bin_data == NULL || chan->spectrum.bin_data_size < chan->spectrum.bin_count){
++	void *old = chan->spectrum.bin_data;
+ 	chan->spectrum.bin_data = realloc(chan->spectrum.bin_data, chan->spectrum.bin_count * sizeof *chan->spectrum.bin_data);
+ 	if(chan->spectrum.bin_data == NULL){
++	  chan->spectrum.bin_data_size = 0;
+ 	  FREE(old); // emulate reallocf()
+ 	  goto quit;
+ 	}
++	chan->spectrum.bin_data_size = chan->spectrum.bin_count;
+       }
+       if(chan->spectrum.rbw <= chan->spectrum.crossover){
+ #if 0
+@@ -198,6 +209,7 @@ int demod_spectrum(void *arg){
+   destroy_plan(&chan->spectrum.plan);
+   FREE(chan->spectrum.window);
+   FREE(chan->spectrum.bin_data);
++  chan->spectrum.bin_data_size = 0;
+   FREE(chan->spectrum.ring);
+   chan->spectrum.ring_size = 0;
+   return chan->demod_type == INVALID_DEMOD ? -1 : 0;

@@ -16,6 +16,22 @@ so no threshold keeps the gate open on a noise-only channel, and radiod emits no
 RTP at all. UberSDR gates audio itself and needs everything passed through.
 Drop this if upstream reinstates an explicit way to disable the FM squelch.
 
+**`0002-spectrum-bin-data-resize.patch`** — lets a spectrum channel's bin count
+grow. `demod_spectrum()` compares `chan->spectrum.bin_count` against a local that
+the reinitialisation block has already synced to it, so only the "buffer is NULL"
+arm of the guard can ever fire: `bin_data` is allocated once, at the bin count the
+channel was created with, while the polls memset and fill `bin_count` elements of
+it. Raising a live channel's BIN_COUNT therefore writes past the end of the block
+and glibc aborts with "corrupted size vs. prev_size in fastbins". Tracks the
+allocated length in a new field instead. UberSDR used to route around it by
+creating each channel at the largest bin count it would ever need, but bins are
+float32 on the wire, so that made every channel carry its deepest zoom's payload
+at every zoom. With the guard fixed, bin_count follows the view — which is what
+lets the WebSDR emulation reach radiod's cheap narrowband path at the two zooms
+that previously sat on the expensive one. **UberSDR ≥ 0.1.62 assumes this patch
+is present**; the two images are pushed together. Drop it if upstream fixes the
+guard; it is worth sending them.
+
 **The point of this repo is that we no longer maintain a fork.** Every patch
 added here is a divergence that has to be rebased by hand on each upstream bump,
 and a silent way for our build to drift from what upstream tests. Prefer, in
