@@ -4,16 +4,20 @@
 # Responsibilities, in order:
 #   1. Seed the persistent config volume from the packaged template on first run
 #   2. Migrate any legacy config in that volume to current ka9q-radio syntax
-#   3. Enable multicast on the container's interfaces
-#   4. Signal UberSDR that radiod has (re)started
-#   5. Start the background helpers UberSDR's admin panel reads
-#   6. exec radiod as PID 1
+#   3. Load FX3 firmware into an unprogrammed RX888
+#   4. Enable multicast on the container's interfaces
+#   5. Signal UberSDR that radiod has (re)started
+#   6. Start the background helpers UberSDR's admin panel reads
+#   7. exec radiod as PID 1
 set -e
 
 CONFIG_DIR=/etc/ka9q-radio
 DEFAULT_CONFIG="$CONFIG_DIR/radiod@ubersdr.conf"
 TEMPLATE_DIR=/usr/local/share/ka9q-radio/ubersdr
 TRIGGER_DIR=/var/run/restart-trigger
+RX888_BOOT=/usr/local/sbin/rx888_boot
+RX888_BOOTFILE_CONF=/etc/radio/rx888_bootfile.conf
+RX888_SETTLE_SECONDS=10
 
 # ---------------------------------------------------------------------------
 # 1. Initialise the config volume from templates if it is empty
@@ -114,7 +118,81 @@ for arg in "$@"; do
 done
 
 # ---------------------------------------------------------------------------
-# 3. Multicast setup
+# 3. RX888 FX3 firmware
+#
+# Upstream moved firmware loading out of radiod and into the separate
+# rx888_boot daemon, started by a udev rule (rules/70-rx888-boot.rules) and a
+# systemd unit (service/rx888_boot.service).  radiod's "firmware" key now
+# defaults to empty and its device scan matches only the *programmed* product
+# id 0x00f1, so an unprogrammed RX888 at 0x04b4:0x00f3 is ignored outright:
+#
+#     Error or device could not be found
+#     rx888_usb_init() failed
+#
+# This image has neither udev nor systemd -- the Dockerfile deliberately skips
+# both -- so nothing would ever program the device.  Run the loader ourselves,
+# with the same firmware the unit would use, then wait for the device to come
+# back at 0x00f1 before starting radiod: rx888_boot's own sleep(1) is not
+# always enough, notably on a Pi 5 whose RP1 controller re-enumerates slower
+# than a Pi 4's.
+#
+# A no-op with any other front end, or on a restart where the RX888 is already
+# programmed: rx888_boot finds no 0x00f3 device, prints nothing, and the wait
+# below is skipped.
+# ---------------------------------------------------------------------------
+
+# Is a 04b4:<pid> device currently on the bus?  Returns 2, distinctly from a
+# plain "no", when sysfs is not readable and the question cannot be answered.
+usb_present() {
+    pid="$1"
+    [ -d /sys/bus/usb/devices ] || return 2
+    for idproduct in /sys/bus/usb/devices/*/idProduct; do
+        [ -e "$idproduct" ] || return 2   # glob did not expand: nothing enumerated
+        [ "$(cat "$idproduct" 2>/dev/null)" = "$pid" ] || continue
+        [ "$(cat "${idproduct%/*}/idVendor" 2>/dev/null)" = "04b4" ] && return 0
+    done
+    return 1
+}
+
+if [ -x "$RX888_BOOT" ]; then
+    # Upstream's own unit reads the image name from this file, so the choice
+    # stays in one place and an operator can change it without editing here.
+    FIRMWARE=""
+    # shellcheck source=/dev/null
+    [ -f "$RX888_BOOTFILE_CONF" ] && . "$RX888_BOOTFILE_CONF"
+
+    echo "Checking for an unprogrammed RX888..."
+    # rx888_boot exits 0 whether or not it found anything, so read what it says.
+    boot_output=$("$RX888_BOOT" ${FIRMWARE:+"$FIRMWARE"} 2>&1) || true
+    [ -n "$boot_output" ] && echo "$boot_output"
+
+    case "$boot_output" in
+    *"rx888 loaded"*)
+        # Programmed just now: the device drops off the bus and comes back as
+        # 0x00f1 with a new address.  Poll for it rather than guessing a delay.
+        echo "Waiting up to ${RX888_SETTLE_SECONDS}s for the RX888 to re-enumerate..."
+        waited=0
+        settled=no
+        while [ "$waited" -lt "$RX888_SETTLE_SECONDS" ]; do
+            present=0
+            usb_present 00f1 || present=$?
+            case "$present" in
+                0) settled=yes; break ;;
+                2) sleep 2; settled=unknown; break ;;  # sysfs unreadable: settle blind
+                *) sleep 1; waited=$((waited + 1)) ;;
+            esac
+        done
+        case "$settled" in
+            yes)     echo "RX888 programmed and enumerated as 04b4:00f1" ;;
+            unknown) echo "Cannot read /sys/bus/usb/devices; proceeding after a fixed settle" ;;
+            *)       echo "WARNING: RX888 did not reappear as 04b4:00f1 within ${RX888_SETTLE_SECONDS}s; radiod may not find it" ;;
+        esac
+        ;;
+    esac
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Multicast setup
 # ---------------------------------------------------------------------------
 if ip link show eth0 >/dev/null 2>&1; then
     echo "Enabling multicast on eth0..."
@@ -124,7 +202,7 @@ fi
 ip link set lo multicast on || true
 
 # ---------------------------------------------------------------------------
-# 4. Record startup time and signal UberSDR
+# 5. Record startup time and signal UberSDR
 # ---------------------------------------------------------------------------
 mkdir -p "$TRIGGER_DIR"
 RADIOD_START_TIME=$(date +%s)
@@ -133,7 +211,7 @@ touch "$TRIGGER_DIR/restart-ubersdr"
 echo "Radiod started at $RADIOD_START_TIME, signaling ubersdr"
 
 # ---------------------------------------------------------------------------
-# 5. Background helpers
+# 6. Background helpers
 #    - restart-watcher: UberSDR drops a trigger file to request a restart
 #    - thread-stats:    per-thread CPU CSV that the admin panel reads
 # ---------------------------------------------------------------------------
@@ -141,6 +219,6 @@ python3 /usr/local/lib/ubersdr-radiod/restart-watcher.py &
 python3 /usr/local/lib/ubersdr-radiod/thread-stats.py &
 
 # ---------------------------------------------------------------------------
-# 6. Start radiod as PID 1
+# 7. Start radiod as PID 1
 # ---------------------------------------------------------------------------
 exec /usr/local/sbin/radiod "$@"

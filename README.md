@@ -18,7 +18,7 @@ Dockerfile                    two-stage build: fetch + compile, then a slim runt
 build.sh                      buildx wrapper (multi-arch, pin management)
 config/radiod@ubersdr.conf    seeded into the config volume on first run
 config/presets.conf           baked to /etc/radio/presets.conf, overrides upstream's
-entrypoint/start-radiod.sh    config migration, multicast setup, then exec radiod
+entrypoint/start-radiod.sh    config migration, rx888 firmware, multicast, exec radiod
 entrypoint/*.py              background helpers the UberSDR admin panel reads
 patches/                      empty by design; see patches/README.md
 ```
@@ -143,10 +143,21 @@ prints the checklist worth walking before shipping a bump.
      calibrated receiver's correction rather than silently discarding it
    The original is kept once as `<config>.pre-upstream`, and every change is
    logged with a `MIGRATION:` prefix.
-3. Enables multicast on `eth0` and `lo`.
-4. Signals UberSDR that radiod has restarted.
-5. Starts the restart watcher and the per-thread CPU stats writer.
-6. `exec`s radiod as PID 1.
+3. **Programs an unprogrammed RX888.** Upstream moved FX3 firmware loading out
+   of radiod into the separate `rx888_boot` daemon, launched by a udev rule and
+   a systemd unit. radiod's `firmware` key now defaults to empty and its device
+   scan matches only the programmed product id `0x00f1`, so a device sitting in
+   bootloader mode at `04b4:00f3` is ignored and radiod exits with
+   `rx888_usb_init() failed`. This image has neither udev nor systemd, so the
+   entrypoint runs `rx888_boot` itself — same binary, same firmware, read from
+   upstream's `/etc/radio/rx888_bootfile.conf` — then polls
+   `/sys/bus/usb/devices` until the device reappears at `04b4:00f1`, up to
+   `RX888_SETTLE_SECONDS` (10). A no-op with any other front end, and on a
+   restart where the device is already programmed.
+4. Enables multicast on `eth0` and `lo`.
+5. Signals UberSDR that radiod has restarted.
+6. Starts the restart watcher and the per-thread CPU stats writer.
+7. `exec`s radiod as PID 1.
 
 ## Configuration
 
