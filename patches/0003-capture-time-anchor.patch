@@ -1,0 +1,450 @@
+UberSDR: publish when each channel's samples were captured
+
+WHAT
+  Estimate, in the RX888 USB callback, the CLOCK_REALTIME at which input sample
+  0 was taken, and publish per channel a pair in its status packets:
+
+      CAPTURE_TS_REF     (240)  RTP timestamp of the first frame of the latest block
+      CAPTURE_TIME_REF   (241)  CLOCK_REALTIME ns at which that frame's signal was captured
+      CAPTURE_GENERATION (242)  bumped whenever the anchor is re-established
+
+  With one pair and the stream's RTP clock rate, a receiver can give every
+  packet its capture time:  capture = TIME_REF + (int32)(ts - TS_REF) / rate.
+
+HOW
+  The A/D clock is GPSDO-locked, so t_capture(n) = t0 + n / samprate and only t0
+  needs estimating.  Every transfer gives one observation, callback time minus
+  the time its last sample represents, which can only exceed t0.  capture_note()
+  keeps the floor of those over a 10 s window of per-second minima (the floor,
+  not the mean: the delay is one-sided with a long scheduling tail).  It starts
+  over when a transfer fails; re-anchors when 50 transfers in a row, spread over
+  at least 150 ms, all sit >2 ms above the anchor (an unflagged loss or a forward
+  clock step -- the span rules out a backlog completing back to back), or when a
+  whole second does; and follows a lower floor at once (a backward clock step).
+  Each re-anchoring bumps the generation.  The anchor is stored before the
+  generation is bumped and read after it, so a channel that sees a new
+  generation always sees the anchor that goes with it.
+
+  capture_mark(), at the end of downconvert(), pairs the RTP timestamp the
+  block's first frame will carry (rtp.timestamp plus frames still queued from
+  earlier blocks) with t0 + sample_index / samprate, less the linear-phase FIR's
+  group delay of (M-1)/2 input samples, and filter2's if it is in use.
+
+  Keeping the pair honest:
+  - It is dropped when a demod restarts, which re-presets the RTP timestamps.
+  - It records the RTP rate it was made at and is withheld from status while the
+    channel's rate differs: a command that changes the rate is answered before
+    the demod restarts, and the old pair must not go out labelled with the new
+    rate.
+  - A block that execute_filter_output() hands back as zeros, without advancing
+    sample_index (the channel fell a whole ring behind), does not re-pair; the
+    existing pair still holds, since those zeros take up a block of timestamps.
+  - A receiver keeps using the last pair it was sent, so the channel sends
+    status on the metadata group within a few blocks (staggered by SSRC)
+    whenever that pair changes meaning: when a new one is made after a restart
+    or a re-anchoring, and when the old one stops being valid -- the anchor is
+    being rebuilt after a failed transfer, the demod restarted, or the channel
+    went idle outside the front end's coverage (its timestamps stop advancing).
+    Status then carries no pair, which a receiver should take as "none".
+
+  Times are CLOCK_REALTIME, not GPS_TIME: it is the clock the kernel stamps
+  received datagrams with (SO_TIMESTAMPNS), so a receiver on the same host
+  subtracts the two directly and no leap-second table is involved.
+
+  Precision relative to the host clock: the floor settles within a few us in
+  simulation, recovers within ~2 us a second after a flagged loss and within
+  ~200 ms of an unflagged one, and rides out a 300 ms event-thread stall
+  without moving.  It still contains a constant hardware latency (FX3 buffering, the
+  last USB packet in flight, A/D pipeline), estimated at 50-300 us and not yet
+  measured; injecting a GPS 1PPS edge would calibrate it.
+
+WHY CONFIG OR UBERSDR CANNOT DO THIS
+  Only radiod sees the moment samples arrive and knows which input sample each
+  RTP timestamp came from.  UberSDR alone can see packet arrival, which includes
+  the 20 ms block fill and all of radiod's processing.
+
+TAGS
+  Numbered 240-242 in their own enum, so upstream appending to enum status_type
+  cannot renumber or collide with them.  Receivers that don't know them skip
+  them, as ka9q's decode_status.c and UberSDR already do for unknown tags.
+
+DROP IT WHEN
+  Upstream grows an equivalent capture-time reference.  Worth offering them.
+
+diff --git a/src/radio.c b/src/radio.c
+index e0d33995..c5a9309f 100644
+--- a/src/radio.c
++++ b/src/radio.c
+@@ -144,6 +144,8 @@ static void *process_section(void *p);
+ static void *sap_send(void *p);
+ static void *rtcp_send(void *p);
+ static int close_chan(chan_t *chan);
++static void capture_mark(chan_t *chan);
++static void capture_invalidate(chan_t *chan);
+ 
+ // Table of frequencies to start
+ struct ftab {
+@@ -935,6 +937,7 @@ static void *demod_thread(void *p){
+       if(Verbose > 0)
+ 	fprintf(stderr,"%s starting at FFT jobum %u, preset RTP TS to %u\n",chan->name,first_block,chan->output.rtp.timestamp);
+     }
++    capture_invalidate(chan); // The timestamps were just re-preset; the first block re-pairs them
+     chan->filter.out.beam = chan->filter.beam;
+     if(chan->filter.out.beam)
+       set_filter_weights(&chan->filter.out,chan->filter.a_weight,chan->filter.b_weight);
+@@ -1453,6 +1456,10 @@ int downconvert(chan_t *chan){
+       }
+       pthread_cond_timedwait(&Frontend.status_cond,&Frontend.status_mutex,&timeout);
+       pthread_mutex_unlock(&Frontend.status_mutex);
++      // No block goes out, so the RTP timestamps stop advancing and fall out of
++      // step with the pair.  After the unlock: capture_invalidate() takes the
++      // channel's status lock, which must not nest inside the front end's
++      capture_invalidate(chan);
+       return 1; // channel idle
+     }
+     pthread_mutex_unlock(&Frontend.status_mutex);
+@@ -1516,10 +1523,194 @@ int downconvert(chan_t *chan){
+     for(int n=0; n < chan->sampcount; n++)
+       energy += cnrmf(chan->baseband[n]);
+     chan->sig.bb_power = energy / chan->sampcount;
++    capture_mark(chan);
+     return 0;
+   }
+   return 0; // Should not actually be reached
+ }
++
++// UberSDR: capture-time anchor.
++//
++// The A/D clock is GPSDO-locked, so the capture time of input sample n is the
++// straight line t0 + n / samprate and only t0 has to be estimated.  Each USB
++// transfer gives one observation: the time its callback ran, minus the time its
++// last sample represents.  That can only exceed t0, by however long the
++// transfer took to reach us, so the floor of the observations over a window --
++// not their mean, which a scheduling tail would drag upward -- estimates t0 plus
++// a constant hardware latency.  Timestamps are CLOCK_REALTIME, the same clock
++// the kernel stamps received datagrams with, so a receiver on this host can
++// subtract the two directly.
++
++// A move in the floor bigger than this is a re-anchoring, not jitter.  One lost
++// RX888 transfer at the default request size is ~4 ms, so this still catches it.
++#define CAPTURE_STEP_NS (2000000LL)
++// This many transfers in a row all that far above the anchor, spread over at
++// least this long, is a loss nobody flagged.  The span rules out a backlog of
++// transfers completing back to back after the event thread was held up: with
++// queuedepth up to 64 that can be 64 late callbacks inside a millisecond, while
++// a real loss leaves them at their normal ~4 ms spacing
++#define CAPTURE_STEP_RUN 50
++#define CAPTURE_STEP_SPAN_NS (150000000LL)
++
++// Called at the end of each second: fold that second's floor into the published anchor.
++static void capture_publish(struct capture_anchor *a,int64_t finished_sec){
++  int const fi = (int)(finished_sec % CAPTURE_WINDOW);
++  int64_t const latest = a->bucket_min[fi];
++  int64_t floor = INT64_MAX;
++  for(int i=0; i < CAPTURE_WINDOW; i++){
++    if(i == fi || a->bucket_sec[i] == 0 || finished_sec - a->bucket_sec[i] >= CAPTURE_WINDOW)
++      continue;
++    if(a->bucket_min[i] < floor)
++      floor = a->bucket_min[i];
++  }
++  int64_t t0;
++  if(floor == INT64_MAX){
++    t0 = latest; // First complete second since a (re)start
++  } else if(latest - floor > CAPTURE_STEP_NS){
++    // A whole second never got down to the old floor: samples were lost or the
++    // clock stepped forward.  The older seconds no longer describe this stream.
++    for(int i=0; i < CAPTURE_WINDOW; i++)
++      if(i != fi)
++	a->bucket_sec[i] = 0;
++    // New anchor before new generation: capture_mark() reads them the other
++    // way round, so a channel that sees the new generation sees the new anchor
++    atomic_store(&a->t0_ns,latest);
++    atomic_fetch_add(&a->generation,1);
++    if(Verbose)
++      fprintf(stderr,"capture anchor moved %+.3f ms, re-anchored\n",(latest - floor) / 1e6);
++    return;
++  }
++  t0 = floor < latest ? floor : latest;
++  atomic_store(&a->t0_ns,t0);
++}
++
++// Front end sample thread: 'samples_end' input samples have now been received,
++// the last of them in a transfer whose callback started at 'arrival_ns'
++// (CLOCK_REALTIME).  'discontinuity' says samples were lost since the last call.
++void capture_note(struct frontend *frontend,int64_t arrival_ns,uint64_t samples_end,bool discontinuity){
++  if(frontend == NULL || frontend->samprate <= 0)
++    return;
++  struct capture_anchor * const a = &frontend->capture;
++  if(discontinuity){
++    // The sample count no longer matches elapsed time; start over
++    for(int i=0; i < CAPTURE_WINDOW; i++)
++      a->bucket_sec[i] = 0;
++    a->current_sec = 0;
++    a->high_run = 0;
++    atomic_store(&a->t0_ns,0); // Unknown until a full second has been seen
++    atomic_fetch_add(&a->generation,1);
++  }
++  int64_t const offset = arrival_ns - (int64_t)llroundl((long double)samples_end * BILLION / frontend->samprate);
++  int64_t const sec = arrival_ns / BILLION;
++  int const i = (int)(sec % CAPTURE_WINDOW);
++  if(sec != a->current_sec){
++    if(a->current_sec != 0)
++      capture_publish(a,a->current_sec);
++    a->current_sec = sec;
++    a->bucket_sec[i] = sec;
++    a->bucket_min[i] = offset;
++  } else if(offset < a->bucket_min[i])
++    a->bucket_min[i] = offset;
++
++  int64_t const t0 = atomic_load(&a->t0_ns);
++  if(t0 == 0)
++    return;
++  if(offset < t0){
++    // A lower floor is strictly better information, so take it now rather than at the end of the second
++    a->high_run = 0;
++    atomic_store(&a->t0_ns,offset); // before the generation; see capture_publish()
++    if(t0 - offset > CAPTURE_STEP_NS)
++      atomic_fetch_add(&a->generation,1); // Clock stepped back
++  } else if(offset - t0 > CAPTURE_STEP_NS){
++    // Samples lost without a failed transfer, or the clock stepped forward.
++    // capture_publish() would see it too, but only after a whole clean second
++    if(a->high_run == 0){
++      a->high_run_start = arrival_ns;
++      a->high_run_min = offset;
++    } else if(offset < a->high_run_min)
++      a->high_run_min = offset;
++    if(++a->high_run >= CAPTURE_STEP_RUN && arrival_ns - a->high_run_start >= CAPTURE_STEP_SPAN_NS){
++      for(int j=0; j < CAPTURE_WINDOW; j++)
++	a->bucket_sec[j] = 0;
++      a->bucket_sec[i] = sec;           // this second's bucket held pre-step values; restart it
++      a->bucket_min[i] = a->high_run_min;
++      a->high_run = 0;
++      atomic_store(&a->t0_ns,a->bucket_min[i]);
++      atomic_fetch_add(&a->generation,1);
++      if(Verbose)
++	fprintf(stderr,"capture anchor moved %+.3f ms, re-anchored\n",(a->bucket_min[i] - t0) / 1e6);
++    }
++  } else
++    a->high_run = 0;
++}
++
++// Ask response() to send this channel's status on the metadata group within a
++// few blocks, spread by SSRC so an event every channel sees at once (a
++// re-anchoring, a lost transfer) isn't one burst.  A receiver keeps using the
++// last pair it was sent, so it has to hear promptly both when there is a new
++// one and when the old one stopped being valid (status then carries none).
++static void capture_announce(chan_t *chan){
++  pthread_mutex_lock(&chan->status.lock);
++  chan->status.global_timer = 1 + (int)(chan->output.rtp.ssrc & 3);
++  pthread_mutex_unlock(&chan->status.lock);
++}
++
++// Drop the channel's pair, and say so, if it had one.
++static void capture_invalidate(chan_t *chan){
++  if(!chan->output.capture_valid)
++    return;
++  chan->output.capture_valid = false;
++  capture_announce(chan);
++}
++
++// Channel thread, once per block: pair the RTP timestamp that the first frame
++// of the baseband just produced will carry with the time its signal was captured.
++static void capture_mark(chan_t *chan){
++  struct frontend * const frontend = chan->frontend;
++  // Generation first, then anchor: the writer stores them the other way round
++  uint32_t const generation = atomic_load(&frontend->capture.generation);
++  int64_t const t0 = atomic_load(&frontend->capture.t0_ns);
++  if(t0 == 0 || frontend->samprate <= 0 || Blocktime <= 0){
++    capture_invalidate(chan); // e.g. a transfer failed: the anchor is being rebuilt
++    return;
++  }
++  // execute_filter_output() hands back a block of zeros without advancing
++  // sample_index when this channel has fallen a whole ring behind.  Those zeros
++  // still take up a block of timestamps, so the existing pair stays right, but a
++  // new one taken now would be a block out
++  if(chan->output.capture_valid && chan->filter.out.sample_index == chan->output.capture_index)
++    return;
++  // Overlap-save: output frame 0 of this block lines up with the first new input
++  // sample of the block, less the group delay of the linear-phase FIR, which is
++  // centred at (M-1)/2 (see set_filter())
++  int64_t first = (int64_t)chan->filter.out.sample_index;
++  double delay = (frontend->in.impulse_length - 1) / (2.0 * frontend->samprate);
++  if(chan->filter2.blocking > 0){
++    // filter2's output spans its last 'blocking' input blocks, of which this was the last
++    first -= (int64_t)(chan->filter2.blocking - 1) * frontend->in.ilen;
++    double const rate2 = chan->filter.out.olen / Blocktime;
++    delay += (chan->filter2.in.impulse_length - 1) / (2.0 * rate2);
++  }
++  // Frames still queued from earlier blocks go out first, under the current timestamp
++  uint32_t queued = chan->output.queue_length > 0 ? (uint32_t)chan->output.queue_length : 0;
++  if(rtp_clock_rate(chan) != chan->output.samprate && chan->output.samprate > 0)
++    queued = (uint32_t)((uint64_t)queued * OPUS_SAMPRATE / chan->output.samprate);
++
++  // Announce a pair made after the timestamps were re-based (demod restart) or
++  // the anchor re-established, rather than leave it unknown until the next
++  // command's reply
++  bool const announce = !chan->output.capture_valid || generation != chan->output.capture_generation;
++
++  chan->output.capture_ts = chan->output.rtp.timestamp + queued;
++  chan->output.capture_ns = t0 + (int64_t)llroundl(((long double)first / frontend->samprate - delay) * BILLION);
++  chan->output.capture_generation = generation;
++  chan->output.capture_rate = rtp_clock_rate(chan);
++  chan->output.capture_index = chan->filter.out.sample_index;
++  chan->output.capture_valid = true;
++
++  if(announce)
++    capture_announce(chan);
++}
+ void response(chan_t *chan,bool response_needed){
+   assert(chan != NULL);
+   if(chan == NULL)
+diff --git a/src/radio.h b/src/radio.h
+index c161e524..c0dcaa24 100644
+--- a/src/radio.h
++++ b/src/radio.h
+@@ -67,6 +67,22 @@ int demod_type_from_name(char const *name);
+ @brief Front end control block, one per radiod instance
+ */
+ #define NSPURS 20 // Size of table of front end spurs - works on coherent only
++
++// UberSDR: capture-time anchor.  Estimates the CLOCK_REALTIME at which input
++// sample 0 was taken, so t_capture(n) = t0_ns + n / samprate.  Fed by the front
++// end's sample thread (capture_note()); read by the channel threads.
++#define CAPTURE_WINDOW 10   // seconds of per-second minima the estimate is taken over
++struct capture_anchor {
++  _Atomic int64_t t0_ns;         // 0 = not yet known
++  _Atomic uint32_t generation;   // bumped whenever the anchor is re-established
++  // Estimator state, touched only by the thread calling capture_note()
++  int64_t bucket_min[CAPTURE_WINDOW]; // lowest (arrival - samples/samprate) seen in each second
++  int64_t bucket_sec[CAPTURE_WINDOW]; // which second each bucket holds; 0 = empty
++  int64_t current_sec;
++  int high_run;                       // consecutive observations more than a step above the anchor
++  int64_t high_run_min;               // and the lowest of them
++  int64_t high_run_start;             // arrival time of the first of them
++};
+ struct frontend {
+   struct sockaddr_storage metadata_dest_socket; // Moved here from global to remove unnecessary dynamic linkages
+   // Stuff we maintain about our upstream source
+@@ -133,6 +149,7 @@ struct frontend {
+   double (*atten)(struct frontend *,double);// optional
+   struct filter_in in; // Input half of fast convolver, shared with all channels
+   double spurs[NSPURS]; // List of frequency spurs to notch, in Hertz (testing)
++  struct capture_anchor capture; // UberSDR
+ };
+ 
+ /**
+@@ -308,6 +325,14 @@ struct channel {
+     double gain;        // Audio gain to normalize amplitude
+     int ttl; // per-channel IP TTL for multicast scope control
+     uint32_t time_snap;    // Snapshot of RTP timestamp sampled by sender in status packets, for linking RTP time to clock time
++    // UberSDR: the RTP timestamp of the first frame of the latest block, and the
++    // CLOCK_REALTIME (ns) at which the signal in that frame was captured
++    bool capture_valid;
++    uint32_t capture_ts;
++    int64_t capture_ns;
++    uint32_t capture_generation;
++    int capture_rate;          // RTP clock rate capture_ts counts at; the pair is withheld once it changes
++    uint64_t capture_index;    // input sample index of the block last paired, to spot a repeated block
+   } output;
+ 
+   struct {
+@@ -354,6 +379,13 @@ struct channel {
+ };
+ typedef struct channel chan_t;
+ 
++// UberSDR: the rate a channel's RTP timestamps count at.  Opus always counts at 48 kHz.
++static inline int rtp_clock_rate(chan_t const *chan){
++  if(chan->output.encoding == OPUS || chan->output.encoding == OPUS_VOIP)
++    return OPUS_SAMPRATE;
++  return chan->output.samprate;
++}
++
+ 
+ extern struct frontend Frontend;
+ extern chan_t Channel_list[];
+@@ -386,6 +418,7 @@ void encode_byte_data(chan_t const *chan,uint8_t *buffer);
+ // Routines common to the internals of all channel demods
+ int compute_tuning(int N, int M, double samprate,int *shift,double *remainder, double freq);
+ int downconvert(chan_t *chan);
++void capture_note(struct frontend *frontend, int64_t arrival_ns, uint64_t samples_end, bool discontinuity);
+ int set_channel_filter(chan_t *chan);
+ void response(chan_t *chan,bool response_needed);
+ 
+diff --git a/src/radio_status.c b/src/radio_status.c
+index 459d37af..a80ff7a5 100644
+--- a/src/radio_status.c
++++ b/src/radio_status.c
+@@ -857,6 +857,14 @@ static unsigned long encode_radio_status(struct frontend const *frontend,chan_t
+     encode_float(&bp,SQUELCH_OPEN,power2dB(chan->squelch.open));
+     encode_float(&bp,SQUELCH_CLOSE,power2dB(chan->squelch.close));
+     encode_int32(&bp,RTP_TIMESNAP,chan->output.rtp.timestamp);
++    // Withheld while the RTP rate differs from the one the pair was made at: a
++    // command that changes it is answered before the demod restarts, and the
++    // old pair must not go out labelled with the new rate
++    if(chan->output.capture_valid && chan->output.capture_rate == rtp_clock_rate(chan)){
++      encode_int32(&bp,(enum status_type)CAPTURE_TS_REF,chan->output.capture_ts);
++      encode_int64(&bp,(enum status_type)CAPTURE_TIME_REF,(uint64_t)chan->output.capture_ns);
++      encode_int32(&bp,(enum status_type)CAPTURE_GENERATION,chan->output.capture_generation);
++    }
+     encode_int64(&bp,OUTPUT_DATA_PACKETS,chan->output.rtp.packets);
+     encode_int(&bp,FILTER2,chan->filter2.blocking);
+     if(chan->filter2.blocking != 0){
+diff --git a/src/rx888.c b/src/rx888.c
+index 1a7e679f..e37b893b 100644
+--- a/src/rx888.c
++++ b/src/rx888.c
+@@ -104,6 +104,7 @@ struct sdrstate {
+   unsigned int reqsize;    // Request size in number of packets
+   unsigned long success_count;  // Number of successful transfers
+   unsigned long failure_count;  // Number of failed transfers
++  bool capture_gap;             // UberSDR: a transfer failed since the last capture_note()
+ 
+   // RF Hardware
+   double high_threshold;
+@@ -769,6 +770,9 @@ static int convert(float *restrict wptr,int16_t const *restrict samples, int sam
+ // Callback called with incoming receiver data from A/D
+ //static void rx_callback(struct libusb_transfer * const transfer){
+ void rx_callback(struct libusb_transfer * const transfer){
++  // UberSDR: first thing, so conversion time doesn't count as transfer latency
++  struct timespec arrival;
++  clock_gettime(CLOCK_REALTIME,&arrival);
+   assert(transfer != NULL);
+   struct sdrstate * const restrict sdr = (struct sdrstate *)transfer->user_data;
+   struct frontend * const restrict frontend = sdr->frontend;
+@@ -781,6 +785,7 @@ void rx_callback(struct libusb_transfer * const transfer){
+    }
+   if(transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+     sdr->failure_count++;
++    sdr->capture_gap = true;
+     if(Verbose > 1)
+       fprintf(stderr,"Transfer %p callback status %s received %d bytes.\n",transfer,
+ 	      libusb_error_name(transfer->status), transfer->actual_length);
+@@ -818,6 +823,8 @@ void rx_callback(struct libusb_transfer * const transfer){
+     frontend->if_power += sdr->power_smooth * ((double)in_energy / sampcount - frontend->if_power);
+ 
+   frontend->samples += sampcount; // Count original samples
++  capture_note(frontend,ts2ns(&arrival),frontend->samples,sdr->capture_gap);
++  sdr->capture_gap = false;
+   if(atomic_load(&sdr->state) == RUNNING) {
+     if(libusb_submit_transfer(transfer) == 0)
+       sdr->xfers_in_progress++;
+diff --git a/src/status.h b/src/status.h
+index 1a9946e6..4b95d603 100644
+--- a/src/status.h
++++ b/src/status.h
+@@ -164,6 +164,15 @@ enum status_type {
+   LIFETIME,           // frames until channel goes away
+ };
+ 
++// UberSDR additions.  Numbered from the top of the one-byte tag space, in their
++// own enum, so that upstream appending to enum status_type can never renumber
++// or collide with them.
++enum ubersdr_status_type {
++  CAPTURE_TS_REF = 240,     // RTP timestamp of a reference frame, in the stream's own RTP clock
++  CAPTURE_TIME_REF = 241,   // CLOCK_REALTIME (ns since the Unix epoch) at which that frame's signal was captured
++  CAPTURE_GENERATION = 242, // bumped whenever the capture anchor is re-established
++};
++
+ size_t encode_string(uint8_t **bp,enum status_type type,void const *buf,size_t buflen);
+ int encode_eol(uint8_t **buf);
+ int encode_byte(uint8_t **buf,enum status_type type,uint8_t x);

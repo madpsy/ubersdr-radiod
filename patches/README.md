@@ -32,6 +32,23 @@ that previously sat on the expensive one. **UberSDR ≥ 0.1.62 assumes this patc
 is present**; the two images are pushed together. Drop it if upstream fixes the
 guard; it is worth sending them.
 
+**`0003-capture-time-anchor.patch`** — tells receivers when each channel's
+samples were captured. The RX888 USB callback estimates the `CLOCK_REALTIME` of
+input sample 0 (floor of callback time minus sample time over a 10 s window;
+the A/D is GPSDO-locked, so the rest follows from the sample count), and each
+channel's status carries a pair: `CAPTURE_TS_REF` (240), the RTP timestamp of
+the first frame of its latest block, and `CAPTURE_TIME_REF` (241), when that
+frame's signal was captured, net of the channel filter's group delay.
+`CAPTURE_GENERATION` (242) bumps whenever the anchor is re-established (lost
+transfer, clock step). One pair gives every packet its capture time:
+`TIME_REF + (int32)(ts − TS_REF) / rate`. The tags are numbered from the top of
+the byte, in their own enum, so upstream appending tags can't collide with them;
+receivers that don't know them skip them. Only radiod can do this: UberSDR only
+sees packets after the 20 ms block fill and all of radiod's processing. **UberSDR
+uses the pair when present** and falls back to packet arrival time without it,
+so either image works with either version. Drop it if upstream grows an
+equivalent; worth offering.
+
 **The point of this repo is that we no longer maintain a fork.** Every patch
 added here is a divergence that has to be rebased by hand on each upstream bump,
 and a silent way for our build to drift from what upstream tests. Prefer, in
