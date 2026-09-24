@@ -38,7 +38,8 @@ input sample 0 (floor of callback time minus sample time over a 10 s window;
 the A/D is GPSDO-locked, so the rest follows from the sample count), and each
 channel's status carries a pair: `CAPTURE_TS_REF` (240), the RTP timestamp of
 the first frame of its latest block, and `CAPTURE_TIME_REF` (241), when that
-frame's signal was captured, net of the channel filter's group delay.
+frame's signal was captured, net of the channel filter's group delay and of the
+RX888's own latency (`RX888_CAPTURE_LATENCY_NS` in `rx888.c`, 0 until measured).
 `CAPTURE_GENERATION` (242) bumps whenever the anchor is re-established (lost
 transfer, clock step). One pair gives every packet its capture time:
 `TIME_REF + (int32)(ts − TS_REF) / rate`. The tags are numbered from the top of

@@ -54,9 +54,11 @@ HOW
   Precision relative to the host clock: the floor settles within a few us in
   simulation, recovers within ~2 us a second after a flagged loss and within
   ~200 ms of an unflagged one, and rides out a 300 ms event-thread stall
-  without moving.  It still contains a constant hardware latency (FX3 buffering, the
-  last USB packet in flight, A/D pipeline), estimated at 50-300 us and not yet
-  measured; injecting a GPS 1PPS edge would calibrate it.
+  without moving.  The floor still contains a constant hardware latency (FX3
+  buffering, the last USB packet in flight, A/D pipeline), estimated at 50-300 us.
+  It belongs to the front end, so rx888.c takes RX888_CAPTURE_LATENCY_NS off every
+  arrival time before capture_note() sees it.  It is 0 until measured: ubersdr-ntp's
+  class delta (radio consensus minus a GPS-fed stratum 1 server) measures it.
 
 WHY CONFIG OR UBERSDR CANNOT DO THIS
   Only radiod sees the moment samples arrive and knows which input sample each
@@ -72,7 +74,7 @@ DROP IT WHEN
   Upstream grows an equivalent capture-time reference.  Worth offering them.
 
 diff --git a/src/radio.c b/src/radio.c
-index e0d33995..c5a9309f 100644
+index e0d33995..c798745e 100644
 --- a/src/radio.c
 +++ b/src/radio.c
 @@ -144,6 +144,8 @@ static void *process_section(void *p);
@@ -103,7 +105,7 @@ index e0d33995..c5a9309f 100644
        return 1; // channel idle
      }
      pthread_mutex_unlock(&Frontend.status_mutex);
-@@ -1516,10 +1523,194 @@ int downconvert(chan_t *chan){
+@@ -1516,10 +1523,196 @@ int downconvert(chan_t *chan){
      for(int n=0; n < chan->sampcount; n++)
        energy += cnrmf(chan->baseband[n]);
      chan->sig.bb_power = energy / chan->sampcount;
@@ -121,7 +123,9 @@ index e0d33995..c5a9309f 100644
 +// last sample represents.  That can only exceed t0, by however long the
 +// transfer took to reach us, so the floor of the observations over a window --
 +// not their mean, which a scheduling tail would drag upward -- estimates t0 plus
-+// a constant hardware latency.  Timestamps are CLOCK_REALTIME, the same clock
++// a constant hardware latency.  The front end knows that latency, so it takes it
++// off the arrival times it passes in (RX888_CAPTURE_LATENCY_NS in rx888.c) and
++// the anchor is t0 itself.  Timestamps are CLOCK_REALTIME, the same clock
 +// the kernel stamps received datagrams with, so a receiver on this host can
 +// subtract the two directly.
 +
@@ -390,7 +394,7 @@ index 459d37af..a80ff7a5 100644
      encode_int(&bp,FILTER2,chan->filter2.blocking);
      if(chan->filter2.blocking != 0){
 diff --git a/src/rx888.c b/src/rx888.c
-index 1a7e679f..e37b893b 100644
+index 1a7e679f..78d0ad4b 100644
 --- a/src/rx888.c
 +++ b/src/rx888.c
 @@ -104,6 +104,7 @@ struct sdrstate {
@@ -401,7 +405,18 @@ index 1a7e679f..e37b893b 100644
  
    // RF Hardware
    double high_threshold;
-@@ -769,6 +770,9 @@ static int convert(float *restrict wptr,int16_t const *restrict samples, int sam
+@@ -766,9 +767,20 @@ static int convert(float *restrict wptr,int16_t const *restrict samples, int sam
+   return clip_count;
+ }
+ 
++// UberSDR: the RX888's own latency between the antenna and this callback, which
++// the capture anchor's floor of arrivals cannot see: the A/D pipeline, the FX3's
++// buffering, the last USB packet of a transfer in flight.  Even the quickest
++// transfer arrives this much after its last sample was taken, so it comes off
++// every arrival time.  Estimated at 50-300 us; 0 until measured against a GPS
++// reference (ubersdr-ntp's radio-minus-NTP class delta measures it)
++#define RX888_CAPTURE_LATENCY_NS (0LL)
++
  // Callback called with incoming receiver data from A/D
  //static void rx_callback(struct libusb_transfer * const transfer){
  void rx_callback(struct libusb_transfer * const transfer){
@@ -411,7 +426,7 @@ index 1a7e679f..e37b893b 100644
    assert(transfer != NULL);
    struct sdrstate * const restrict sdr = (struct sdrstate *)transfer->user_data;
    struct frontend * const restrict frontend = sdr->frontend;
-@@ -781,6 +785,7 @@ void rx_callback(struct libusb_transfer * const transfer){
+@@ -781,6 +793,7 @@ void rx_callback(struct libusb_transfer * const transfer){
     }
    if(transfer->status != LIBUSB_TRANSFER_COMPLETED) {
      sdr->failure_count++;
@@ -419,11 +434,11 @@ index 1a7e679f..e37b893b 100644
      if(Verbose > 1)
        fprintf(stderr,"Transfer %p callback status %s received %d bytes.\n",transfer,
  	      libusb_error_name(transfer->status), transfer->actual_length);
-@@ -818,6 +823,8 @@ void rx_callback(struct libusb_transfer * const transfer){
+@@ -818,6 +831,8 @@ void rx_callback(struct libusb_transfer * const transfer){
      frontend->if_power += sdr->power_smooth * ((double)in_energy / sampcount - frontend->if_power);
  
    frontend->samples += sampcount; // Count original samples
-+  capture_note(frontend,ts2ns(&arrival),frontend->samples,sdr->capture_gap);
++  capture_note(frontend,ts2ns(&arrival) - RX888_CAPTURE_LATENCY_NS,frontend->samples,sdr->capture_gap);
 +  sdr->capture_gap = false;
    if(atomic_load(&sdr->state) == RUNNING) {
      if(libusb_submit_transfer(transfer) == 0)
