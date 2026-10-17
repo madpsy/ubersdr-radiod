@@ -38,8 +38,11 @@ and upstream has sensibly not gone further yet. Our hosts take time from a
 GPSDO/PPS, though, and ubersdr-ntp wants microseconds. So the patch estimates
 the time from the lowest USB-callback delays, which strips out the jitter. It
 also accounts for filter group delay and queued frames, and flags re-anchoring
-with a generation counter. If upstream ever publishes a capture time for
-`INPUT_SAMPLES` that has that jitter filtered out, most of this patch can go.
+with a generation counter. The lowest-delay estimator (`capture_note()` and
+its hook in `rx888.c`) is the piece worth offering upstream. If upstream adopted
+it and published the resulting capture time next to `INPUT_SAMPLES`, we would
+stop carrying it. Most of the per-channel conversion could then move into
+UberSDR, using the filter lengths and `RTP_TIMESNAP` already in status.
 
 **The point of this repo is that we no longer maintain a fork.** Every patch
 added here is a divergence that has to be rebased by hand on each upstream bump,
