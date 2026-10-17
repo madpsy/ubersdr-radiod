@@ -18,11 +18,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
       ca-certificates \
       git \
+      pkg-config \
       rsync \
       libairspy-dev \
       libairspyhf-dev \
       libbladerf-dev \
       libbsd-dev \
+      libcsv-dev \
       libfftw3-dev \
       libhackrf-dev \
       libiniparser-dev \
@@ -87,13 +89,17 @@ WORKDIR /build/ka9q-radio
 # radio user) and would otherwise need libcap2-bin and a created user.
 ENV DEB_BUILD_ARCH=container
 
+# NATIVE=0: upstream's src/Makefile defaults to -march=native, which would tune
+# the binaries to whichever machine runs the build (or to QEMU's idea of a CPU for
+# arm64) and SIGILL on the hosts that pull the image.
+
 RUN make -C src -j"$(nproc)" \
       ENABLE_AIRSPY=${ENABLE_AIRSPY} ENABLE_AIRSPYHF=${ENABLE_AIRSPYHF} \
       ENABLE_BLADERF=${ENABLE_BLADERF} ENABLE_FOBOS=${ENABLE_FOBOS} \
       ENABLE_FUNCUBE=${ENABLE_FUNCUBE} ENABLE_HACKRF=${ENABLE_HACKRF} \
       ENABLE_HYDRASDR=${ENABLE_HYDRASDR} ENABLE_RTLSDR=${ENABLE_RTLSDR} \
       ENABLE_RX888=${ENABLE_RX888} ENABLE_SDRPLAY=${ENABLE_SDRPLAY} \
-      ENABLE_SIG_GEN=${ENABLE_SIG_GEN}
+      ENABLE_SIG_GEN=${ENABLE_SIG_GEN} NATIVE=0
 
 # Install only what the container needs: binaries and driver plugins (src),
 # presets.conf plus the rx888 FX3 firmware images (share), and upstream's
@@ -107,7 +113,7 @@ RUN mkdir -p /etc/radio \
       ENABLE_FUNCUBE=${ENABLE_FUNCUBE} ENABLE_HACKRF=${ENABLE_HACKRF} \
       ENABLE_HYDRASDR=${ENABLE_HYDRASDR} ENABLE_RTLSDR=${ENABLE_RTLSDR} \
       ENABLE_RX888=${ENABLE_RX888} ENABLE_SDRPLAY=${ENABLE_SDRPLAY} \
-      ENABLE_SIG_GEN=${ENABLE_SIG_GEN} \
+      ENABLE_SIG_GEN=${ENABLE_SIG_GEN} NATIVE=0 \
  && make -C share install \
  && make -C config install
 
@@ -131,6 +137,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libairspyhf1 \
       libbladerf2 \
       libbsd0 \
+      libcsv3 \
       libfftw3-single3 \
       libhackrf0 \
       libiniparser1 \

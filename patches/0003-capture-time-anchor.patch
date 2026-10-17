@@ -28,7 +28,10 @@ HOW
   capture_mark(), at the end of downconvert(), pairs the RTP timestamp the
   block's first frame will carry (rtp.timestamp plus frames still queued from
   earlier blocks) with t0 + sample_index / samprate, less the linear-phase FIR's
-  group delay of (M-1)/2 input samples, and filter2's if it is in use.
+  group delay of (M-1)/2 input samples, filter2's if it is in use, and any
+  filtering the demod does after the baseband: WFM's composite filter delays
+  the audio by half a block (10 ms at the default 20 ms), plus half a composite
+  sample for the discriminator.  wfm.c sets that in capture_demod_delay.
 
   Keeping the pair honest:
   - It is dropped when a demod restarts, which re-presets the RTP timestamps.
@@ -74,27 +77,28 @@ DROP IT WHEN
   Upstream grows an equivalent capture-time reference.  Worth offering them.
 
 diff --git a/src/radio.c b/src/radio.c
-index e0d33995..c798745e 100644
+index 4d9aa25f..37c29deb 100644
 --- a/src/radio.c
 +++ b/src/radio.c
-@@ -144,6 +144,8 @@ static void *process_section(void *p);
- static void *sap_send(void *p);
- static void *rtcp_send(void *p);
+@@ -137,6 +137,8 @@ static int setup_hardware(char const *sname);
+ static void *process_section(void *p);
  static int close_chan(chan_t *chan);
+ static float get_tone(char const *sname,int i);
 +static void capture_mark(chan_t *chan);
 +static void capture_invalidate(chan_t *chan);
- 
- // Table of frequencies to start
- struct ftab {
-@@ -935,6 +937,7 @@ static void *demod_thread(void *p){
+ static int fcompare(void const *ap, void const *bp); // Compare frequencies in table entries
+ static int tcompare(void const *ap,void const *bp); // Lookup frequency in sorted table
+ static uint32_t round2(uint32_t v);
+@@ -954,6 +956,8 @@ static void *demod_thread(void *p){
        if(Verbose > 0)
  	fprintf(stderr,"%s starting at FFT jobum %u, preset RTP TS to %u\n",chan->name,first_block,chan->output.rtp.timestamp);
      }
 +    capture_invalidate(chan); // The timestamps were just re-preset; the first block re-pairs them
++    chan->output.capture_demod_delay = 0; // Each demod sets its own, if it has one
      chan->filter.out.beam = chan->filter.beam;
      if(chan->filter.out.beam)
        set_filter_weights(&chan->filter.out,chan->filter.a_weight,chan->filter.b_weight);
-@@ -1453,6 +1456,10 @@ int downconvert(chan_t *chan){
+@@ -1269,6 +1273,10 @@ int downconvert(chan_t * const chan){
        }
        pthread_cond_timedwait(&Frontend.status_cond,&Frontend.status_mutex,&timeout);
        pthread_mutex_unlock(&Frontend.status_mutex);
@@ -105,10 +109,10 @@ index e0d33995..c798745e 100644
        return 1; // channel idle
      }
      pthread_mutex_unlock(&Frontend.status_mutex);
-@@ -1516,10 +1523,196 @@ int downconvert(chan_t *chan){
-     for(int n=0; n < chan->sampcount; n++)
-       energy += cnrmf(chan->baseband[n]);
-     chan->sig.bb_power = energy / chan->sampcount;
+@@ -1334,10 +1342,197 @@ int downconvert(chan_t * const chan){
+ 	energy += cnrmf(chan->baseband[n]);
+       chan->sig.bb_power = energy / chan->sampcount;
+     }
 +    capture_mark(chan);
      return 0;
    }
@@ -279,6 +283,7 @@ index e0d33995..c798745e 100644
 +    double const rate2 = chan->filter.out.olen / Blocktime;
 +    delay += (chan->filter2.in.impulse_length - 1) / (2.0 * rate2);
 +  }
++  delay += chan->output.capture_demod_delay; // Filtering inside the demod, after the baseband
 +  // Frames still queued from earlier blocks go out first, under the current timestamp
 +  uint32_t queued = chan->output.queue_length > 0 ? (uint32_t)chan->output.queue_length : 0;
 +  if(rtp_clock_rate(chan) != chan->output.samprate && chan->output.samprate > 0)
@@ -299,14 +304,14 @@ index e0d33995..c798745e 100644
 +  if(announce)
 +    capture_announce(chan);
 +}
- void response(chan_t *chan,bool response_needed){
+ void response(chan_t * const chan){
    assert(chan != NULL);
    if(chan == NULL)
 diff --git a/src/radio.h b/src/radio.h
-index c161e524..c0dcaa24 100644
+index eeceacc6..4fde4b7d 100644
 --- a/src/radio.h
 +++ b/src/radio.h
-@@ -67,6 +67,22 @@ int demod_type_from_name(char const *name);
+@@ -35,6 +35,22 @@ int demod_type_from_name(char const *name);
  @brief Front end control block, one per radiod instance
  */
  #define NSPURS 20 // Size of table of front end spurs - works on coherent only
@@ -329,17 +334,17 @@ index c161e524..c0dcaa24 100644
  struct frontend {
    struct sockaddr_storage metadata_dest_socket; // Moved here from global to remove unnecessary dynamic linkages
    // Stuff we maintain about our upstream source
-@@ -133,6 +149,7 @@ struct frontend {
-   double (*atten)(struct frontend *,double);// optional
+@@ -103,6 +119,7 @@ struct frontend {
+   float (*atten)(struct frontend *,float);// optional
    struct filter_in in; // Input half of fast convolver, shared with all channels
    double spurs[NSPURS]; // List of frequency spurs to notch, in Hertz (testing)
 +  struct capture_anchor capture; // UberSDR
  };
  
  /**
-@@ -308,6 +325,14 @@ struct channel {
-     double gain;        // Audio gain to normalize amplitude
-     int ttl; // per-channel IP TTL for multicast scope control
+@@ -278,6 +295,15 @@ struct channel {
+     float gain;           // Audio gain to normalize amplitude
+     int ttl;               // per-channel IP TTL for multicast scope control
      uint32_t time_snap;    // Snapshot of RTP timestamp sampled by sender in status packets, for linking RTP time to clock time
 +    // UberSDR: the RTP timestamp of the first frame of the latest block, and the
 +    // CLOCK_REALTIME (ns) at which the signal in that frame was captured
@@ -349,10 +354,11 @@ index c161e524..c0dcaa24 100644
 +    uint32_t capture_generation;
 +    int capture_rate;          // RTP clock rate capture_ts counts at; the pair is withheld once it changes
 +    uint64_t capture_index;    // input sample index of the block last paired, to spot a repeated block
++    double capture_demod_delay; // seconds the demod's own filtering delays its output beyond the baseband (WFM's composite filter); set by the demod
    } output;
  
    struct {
-@@ -354,6 +379,13 @@ struct channel {
+@@ -327,6 +353,14 @@ struct channel {
  };
  typedef struct channel chan_t;
  
@@ -363,22 +369,23 @@ index c161e524..c0dcaa24 100644
 +  return chan->output.samprate;
 +}
 +
- 
++
  extern struct frontend Frontend;
  extern chan_t Channel_list[];
-@@ -386,6 +418,7 @@ void encode_byte_data(chan_t const *chan,uint8_t *buffer);
+ extern chan_t Template;
+@@ -358,6 +392,7 @@ void encode_byte_data(chan_t const *chan,uint8_t *buffer);
  // Routines common to the internals of all channel demods
- int compute_tuning(int N, int M, double samprate,int *shift,double *remainder, double freq);
+ int compute_tuning(int N, double samprate,int *shift,double *remainder, double freq);
  int downconvert(chan_t *chan);
 +void capture_note(struct frontend *frontend, int64_t arrival_ns, uint64_t samples_end, bool discontinuity);
  int set_channel_filter(chan_t *chan);
- void response(chan_t *chan,bool response_needed);
- 
+ void response(chan_t *chan);
+ float estimate_noise(chan_t const *chan,int shift);// Noise estimator tuning
 diff --git a/src/radio_status.c b/src/radio_status.c
-index 459d37af..a80ff7a5 100644
+index ad852a8b..d3d0a9dd 100644
 --- a/src/radio_status.c
 +++ b/src/radio_status.c
-@@ -857,6 +857,14 @@ static unsigned long encode_radio_status(struct frontend const *frontend,chan_t
+@@ -865,6 +865,14 @@ static unsigned long encode_radio_status(struct frontend const * const frontend,
      encode_float(&bp,SQUELCH_OPEN,power2dB(chan->squelch.open));
      encode_float(&bp,SQUELCH_CLOSE,power2dB(chan->squelch.close));
      encode_int32(&bp,RTP_TIMESNAP,chan->output.rtp.timestamp);
@@ -394,18 +401,18 @@ index 459d37af..a80ff7a5 100644
      encode_int(&bp,FILTER2,chan->filter2.blocking);
      if(chan->filter2.blocking != 0){
 diff --git a/src/rx888.c b/src/rx888.c
-index 1a7e679f..78d0ad4b 100644
+index adcddb3f..22d78e0a 100644
 --- a/src/rx888.c
 +++ b/src/rx888.c
-@@ -104,6 +104,7 @@ struct sdrstate {
+@@ -95,6 +95,7 @@ struct sdrstate {
    unsigned int reqsize;    // Request size in number of packets
    unsigned long success_count;  // Number of successful transfers
    unsigned long failure_count;  // Number of failed transfers
 +  bool capture_gap;             // UberSDR: a transfer failed since the last capture_note()
  
    // RF Hardware
-   double high_threshold;
-@@ -766,9 +767,20 @@ static int convert(float *restrict wptr,int16_t const *restrict samples, int sam
+   float high_threshold;
+@@ -874,9 +875,20 @@ static int convert(struct sdrstate *sdr, float *restrict wptr, int16_t const *re
    return clip_count;
  }
  
@@ -426,7 +433,7 @@ index 1a7e679f..78d0ad4b 100644
    assert(transfer != NULL);
    struct sdrstate * const restrict sdr = (struct sdrstate *)transfer->user_data;
    struct frontend * const restrict frontend = sdr->frontend;
-@@ -781,6 +793,7 @@ void rx_callback(struct libusb_transfer * const transfer){
+@@ -889,6 +901,7 @@ void rx_callback(struct libusb_transfer * const transfer){
     }
    if(transfer->status != LIBUSB_TRANSFER_COMPLETED) {
      sdr->failure_count++;
@@ -434,9 +441,9 @@ index 1a7e679f..78d0ad4b 100644
      if(Verbose > 1)
        fprintf(stderr,"Transfer %p callback status %s received %d bytes.\n",transfer,
  	      libusb_error_name(transfer->status), transfer->actual_length);
-@@ -818,6 +831,8 @@ void rx_callback(struct libusb_transfer * const transfer){
-     frontend->if_power += sdr->power_smooth * ((double)in_energy / sampcount - frontend->if_power);
- 
+@@ -933,6 +946,8 @@ void rx_callback(struct libusb_transfer * const transfer){
+     frontend->if_power += sdr->power_smooth * (net_power - frontend->if_power);
+   }
    frontend->samples += sampcount; // Count original samples
 +  capture_note(frontend,ts2ns(&arrival) - RX888_CAPTURE_LATENCY_NS,frontend->samples,sdr->capture_gap);
 +  sdr->capture_gap = false;
@@ -444,12 +451,12 @@ index 1a7e679f..78d0ad4b 100644
      if(libusb_submit_transfer(transfer) == 0)
        sdr->xfers_in_progress++;
 diff --git a/src/status.h b/src/status.h
-index 1a9946e6..4b95d603 100644
+index d950ba49..7658410c 100644
 --- a/src/status.h
 +++ b/src/status.h
-@@ -164,6 +164,15 @@ enum status_type {
-   LIFETIME,           // frames until channel goes away
+@@ -193,6 +193,15 @@ struct demodtab {
  };
+ extern struct demodtab const Demodtab[];
  
 +// UberSDR additions.  Numbered from the top of the one-byte tag space, in their
 +// own enum, so that upstream appending to enum status_type can never renumber
@@ -463,3 +470,19 @@ index 1a9946e6..4b95d603 100644
  size_t encode_string(uint8_t **bp,enum status_type type,void const *buf,size_t buflen);
  int encode_eol(uint8_t **buf);
  int encode_byte(uint8_t **buf,enum status_type type,uint8_t x);
+diff --git a/src/wfm.c b/src/wfm.c
+index 5e8ff42a..def5de7a 100644
+--- a/src/wfm.c
++++ b/src/wfm.c
+@@ -56,6 +56,11 @@ int demod_wfm(void *arg){
+   int const composite_L = (int)lrint(Composite_samprate * Blocktime); // Intermediate sample rate
+   int const composite_M = composite_L + 1; // 2:1 overlap (50%)
+   int const composite_N = composite_L + composite_M - 1;
++  // UberSDR: the audio comes out of the composite filter, whose linear-phase FIR
++  // delays it by (M-1)/2 composite samples (half a block), and the discriminator's
++  // first difference by another half sample.  The capture anchor's pair is made
++  // on the baseband, so it has to know
++  chan->output.capture_demod_delay = (composite_M - 1) / (2.0 * Composite_samprate) + 0.5 / Composite_samprate;
+ 
+   // output forced to 48 kHz for now
+   const int audio_L = (int)lrint(Audio_samprate * Blocktime);
