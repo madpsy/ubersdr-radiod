@@ -58,24 +58,7 @@ If you do add one, name it `NNNN-short-description.patch` and say at the top of
 the file what it does, why config or UberSDR could not, and what would let us
 drop it.
 
-The FM squelch patch (now dropped, below) is the counter-example that shows
-where the line sits: it went in only after establishing that neither config nor
-UberSDR could reach the behaviour, because the decision is made inside radiod
-before any stream exists -- and it came out as soon as upstream fixed it.
-
-## Fixed upstream, dropped
-
-Both landed upstream on 2026-10-16/17 and went with the bump to `486fca36`:
-
-- **`0001-fm-always-open-squelch`** — `8e6dcbe5`/`75ac1b6d` clamp `fm.snr` to
-  >= 0 on both estimator paths and stop replacing a zero threshold with the
-  default. `-999` dB is `exp10f(-99.9)`, which underflows to exactly `0.0f`, so
-  `snr >= open` always holds and our presets' sentinel works unpatched again.
-  If upstream ever widens `squelch.open` back to double, `-999` becomes 1.3e-100
-  and FM silently gates on noise: check `fm.c` and `radio.h` on every bump.
-- **`0002-spectrum-bin-data-resize`** — `c5481fef` is the same fix, field name
-  and all. UberSDR >= 0.1.62 still needs it; it is now in every upstream build.
-
-Deliberately dropped and not worth revisiting: the rx888 bias-T config keys, the
-A/D data-gap counter, per-channel filter wait statistics, master block-gap
-logging, and the `[Filter Stats]` thread. All diagnostics, all divergence.
+The old FM squelch patch is the counter-example that shows where the line
+sits: it went in only after establishing that neither config nor UberSDR could
+reach the behaviour, because the decision is made inside radiod before any
+stream exists -- and it came out as soon as upstream fixed it.
