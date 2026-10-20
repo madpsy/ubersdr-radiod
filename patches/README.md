@@ -15,7 +15,8 @@ channel's status carries a pair: `CAPTURE_TS_REF` (240), the RTP timestamp of
 the first frame of its latest block, and `CAPTURE_TIME_REF` (241), when that
 frame's signal was captured, net of the channel filter's group delay (and of
 WFM's composite filter, half a block) and of the
-RX888's own latency (`RX888_CAPTURE_LATENCY_NS` in `rx888.c`, 0 until measured).
+RX888's own latency (`capture-latency` in `[rx888]`, seconds, either sign,
+clamped to ±1 s; 0 until measured).
 `CAPTURE_GENERATION` (242) bumps whenever the anchor is re-established (lost
 transfer, clock step). One pair gives every packet its capture time:
 `TIME_REF + (int32)(ts − TS_REF) / rate`. The tags are numbered from the top of
